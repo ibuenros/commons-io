@@ -262,6 +262,48 @@ public class TailerTest extends FileBasedTestCase {
         assertEquals("fileRotated should be be called", 1 , listener.rotated);
     }
 
+    public void testFollowTailer() throws Exception {
+
+        // Create & start the Tailer
+        final long delayMillis = 50;
+        final File file = new File(getTestDirectory(), "follow-tailer1-test.txt");
+        final File rotatedFile = new File(getTestDirectory(), "follow-tailer1-test.rotated.txt");
+        createFile(file, 0);
+        final TestTailerListener listener = new TestTailerListener();
+        final String osname = System.getProperty("os.name");
+        final boolean isWindows = osname.startsWith("Windows");
+        tailer = new Tailer(file, listener, delayMillis, false, TailerReaderPersistenceOptions.FOLLOW_OPEN_ONCE);
+        final Thread thread = new Thread(tailer);
+        thread.start();
+
+        // Write some lines to the file
+        write(file, "Line one", "Line two");
+        final long testDelayMillis = delayMillis * 5;
+        Thread.sleep(testDelayMillis);
+        List<String> lines = listener.getLines();
+        assertEquals("1 line count", 2, lines.size());
+        assertEquals("1 line 1", "Line one", lines.get(0));
+        assertEquals("1 line 2", "Line two", lines.get(1));
+        listener.clear();
+
+        // Move file and write more lines
+        assertFalse("Rotated file should not exist before moving", rotatedFile.exists());
+        file.renameTo(rotatedFile);
+        assertTrue("Rotated file should exist after moving", rotatedFile.exists());
+        assertFalse("Original file should not exist after rotation", file.exists());
+        Thread.sleep(testDelayMillis);
+        write(rotatedFile, "Line three");
+        Thread.sleep(testDelayMillis);
+        lines = listener.getLines();
+        assertEquals("2 line count", 1, lines.size());
+        assertEquals("2 line 1", "Line three", lines.get(0));
+
+        // wait for timeout and check tailer stopped
+        Thread.sleep(20 * delayMillis);
+        assertFalse(tailer.getRun());
+
+    }
+
     @Override
     protected void createFile(final File file, final long size)
         throws IOException {

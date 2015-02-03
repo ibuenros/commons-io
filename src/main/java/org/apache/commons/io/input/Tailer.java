@@ -18,11 +18,7 @@ package org.apache.commons.io.input;
 
 import static org.apache.commons.io.IOUtils.EOF;
 
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.io.*;
 import java.nio.charset.Charset;
 
 import org.apache.commons.io.FileUtils;
@@ -165,9 +161,29 @@ public class Tailer implements Runnable {
     private final boolean reOpen;
 
     /**
+     * Whether to keep reading from old file after it has been rotated.
+     */
+    private final boolean followReader;
+
+    /**
+     * Maximum number of iterations before closing reader after file has been rotated.
+     */
+    private final long maxIterationsBeforeClosing;
+
+    /**
      * The tailer will run as long as this value is true.
      */
     private volatile boolean run = true;
+
+    /**
+     * Whether the file has been rotated.
+     */
+    private volatile boolean rotated = false;
+
+    /**
+     * Counts the number of iterations without modification after the file has been rotated.
+     */
+    private volatile int noModifyCounter = 0;
 
     /**
      * Creates a Tailer for the given file, starting from the beginning, with the default delay of 1.0s.
@@ -212,6 +228,18 @@ public class Tailer implements Runnable {
     }
 
     /**
+     * Creates a Tailer for the given file, with a delay other than the default 1.0s.
+     * @param file the file to follow.
+     * @param listener the TailerListener to use.
+     * @param delayMillis the delay between checks of the file for new content in milliseconds.
+     * @param end Set to true to tail from the end of the file, false to tail from the beginning of the file.
+     * @param readerPersistence the behavior of the file reader {@link org.apache.commons.io.input.TailerReaderPersistenceOptions}
+     */
+    public Tailer(final File file, final TailerListener listener, final long delayMillis, final boolean end, final TailerReaderPersistenceOptions readerPersistence ) {
+        this(file, listener, delayMillis, end, readerPersistence, DEFAULT_BUFSIZE);
+    }
+
+    /**
      * Creates a Tailer for the given file, with a specified buffer size.
      * @param file the file to follow.
      * @param listener the TailerListener to use.
@@ -233,7 +261,34 @@ public class Tailer implements Runnable {
      * @param bufSize Buffer size
      */
     public Tailer(final File file, final TailerListener listener, final long delayMillis, final boolean end, final boolean reOpen, final int bufSize) {
-        this(file, DEFAULT_CHARSET, listener, delayMillis, end, reOpen, bufSize);
+        this(file, DEFAULT_CHARSET, listener, delayMillis, end, reOpen ? TailerReaderPersistenceOptions.NO_FOLLOW_OPEN_ONCE : TailerReaderPersistenceOptions.NO_FOLLOW_REOPEN, bufSize, 0);
+    }
+
+    /**
+     * Creates a Tailer for the given file, with a specified buffer size.
+     * @param file The file to follow.
+     * @param listener the TailerListener to use.
+     * @param delayMillis the delay between checks of the file for new content in milliseconds.
+     * @param end Set to true to tail from the end of the file, false to tail from the beginning of the file.
+     * @param readerPersistence the behavior of the file reader {@link org.apache.commons.io.input.TailerReaderPersistenceOptions}
+     * @param bufSize Buffer size
+     */
+    public Tailer(final File file, final TailerListener listener, final long delayMillis, final boolean end, final TailerReaderPersistenceOptions readerPersistence, final int bufSize) {
+        this(file, DEFAULT_CHARSET, listener, delayMillis, end, readerPersistence, bufSize, 10 * delayMillis);
+    }
+
+    /**
+     * Creates a Tailer for the given file, with a specified buffer size.
+     * @param file The file to follow.
+     * @param listener the TailerListener to use.
+     * @param delayMillis the delay between checks of the file for new content in milliseconds.
+     * @param end Set to true to tail from the end of the file, false to tail from the beginning of the file.
+     * @param reOpen if true, close and reopen the file between reading chunks
+     * @param bufSize Buffer size
+     */
+    public Tailer(final File file, final Charset cset, final TailerListener listener, final long delayMillis,
+                  final boolean end, final boolean reOpen, final int bufSize) {
+        this(file, cset, listener, delayMillis, end, reOpen ? TailerReaderPersistenceOptions.NO_FOLLOW_OPEN_ONCE : TailerReaderPersistenceOptions.NO_FOLLOW_REOPEN, bufSize, 0);
     }
 
     /**
@@ -243,11 +298,13 @@ public class Tailer implements Runnable {
      * @param listener the TailerListener to use.
      * @param delayMillis the delay between checks of the file for new content in milliseconds.
      * @param end Set to true to tail from the end of the file, false to tail from the beginning of the file.
-     * @param reOpen if true, close and reopen the file between reading chunks
+     * @param readerPersistence the behavior of the file reader {@link org.apache.commons.io.input.TailerReaderPersistenceOptions}
      * @param bufSize Buffer size
+     * @param timeoutAfterRotation if readerPersistence is set to FOLLOW_OPEN_ONCE, tailer will automatically close after
+     *                             this many milliseconds without change. Set to negative number to never close automatically.
      */
-    public Tailer(final File file, final Charset cset, final TailerListener listener, final long delayMillis, final boolean end, final boolean reOpen
-            , final int bufSize) {
+    public Tailer(final File file, final Charset cset, final TailerListener listener, final long delayMillis,
+                  final boolean end, final TailerReaderPersistenceOptions readerPersistence, final int bufSize, final long timeoutAfterRotation) {
         this.file = file;
         this.delayMillis = delayMillis;
         this.end = end;
@@ -257,7 +314,28 @@ public class Tailer implements Runnable {
         // Save and prepare the listener
         this.listener = listener;
         listener.init(this);
-        this.reOpen = reOpen;
+
+        this.maxIterationsBeforeClosing = timeoutAfterRotation / delayMillis;
+        switch (readerPersistence) {
+            case NO_FOLLOW_OPEN_ONCE:
+                this.reOpen = false;
+                this.followReader = false;
+                break;
+            case NO_FOLLOW_REOPEN:
+                this.followReader = false;
+                this.reOpen = true;
+                break;
+            case FOLLOW_OPEN_ONCE:
+                this.reOpen = false;
+                this.followReader = true;
+                break;
+            default:
+                this.reOpen = false;
+                this.followReader = false;
+        }
+        if (this.reOpen && this.followReader) {
+            listener.handle(new Exception("Cannot followReader and reOpen in the same Tailer."));
+        }
         this.cset = cset; 
     }
 
@@ -305,7 +383,25 @@ public class Tailer implements Runnable {
      */
     public static Tailer create(final File file, final Charset charset, final TailerListener listener, final long delayMillis, final boolean end, final boolean reOpen
             ,final int bufSize) {
-        final Tailer tailer = new Tailer(file, charset, listener, delayMillis, end, reOpen, bufSize);
+        return create(file, charset, listener, delayMillis, end,
+                reOpen ? TailerReaderPersistenceOptions.NO_FOLLOW_OPEN_ONCE : TailerReaderPersistenceOptions.NO_FOLLOW_REOPEN, bufSize, 0);
+    }
+
+    /**
+     * Creates and starts a Tailer for the given file.
+     *
+     * @param file the file to follow.
+     * @param charset the character set to use for reading the file
+     * @param listener the TailerListener to use.
+     * @param delayMillis the delay between checks of the file for new content in milliseconds.
+     * @param end Set to true to tail from the end of the file, false to tail from the beginning of the file.
+     * @param readerPersistence the behavior of the file reader {@link org.apache.commons.io.input.TailerReaderPersistenceOptions}
+     * @param bufSize buffer size.
+     * @return The new tailer
+     */
+    public static Tailer create(final File file, final Charset charset, final TailerListener listener, final long delayMillis, final boolean end, final TailerReaderPersistenceOptions readerPersistence
+            ,final int bufSize, long millisToFollowAfterRotation) {
+        final Tailer tailer = new Tailer(file, charset, listener, delayMillis, end, readerPersistence, bufSize, millisToFollowAfterRotation);
         final Thread thread = new Thread(tailer);
         thread.setDaemon(true);
         thread.start();
@@ -337,6 +433,20 @@ public class Tailer implements Runnable {
      */
     public static Tailer create(final File file, final TailerListener listener, final long delayMillis, final boolean end, final boolean reOpen) {
         return create(file, listener, delayMillis, end, reOpen, DEFAULT_BUFSIZE);
+    }
+
+    /**
+     * Creates and starts a Tailer for the given file with default buffer size.
+     *
+     * @param file the file to follow.
+     * @param listener the TailerListener to use.
+     * @param delayMillis the delay between checks of the file for new content in milliseconds.
+     * @param end Set to true to tail from the end of the file, false to tail from the beginning of the file.
+     * @param readerPersistence the behavior of the file reader {@link org.apache.commons.io.input.TailerReaderPersistenceOptions}
+     * @return The new tailer
+     */
+    public static Tailer create(final File file, final TailerListener listener, final long delayMillis, final boolean end, final TailerReaderPersistenceOptions readerPersistence) {
+        return create(file, DEFAULT_CHARSET, listener, delayMillis, end, readerPersistence, DEFAULT_BUFSIZE, 10 * delayMillis);
     }
 
     /**
@@ -419,9 +529,30 @@ public class Tailer implements Runnable {
                 final boolean newer = FileUtils.isFileNewer(file, last); // IO-279, must be done first
                 // Check the file length to see if it was rotated
                 final long length = file.length();
-                if (length < position) {
+                if (rotated && followReader) {
+                    // File has been rotated, but Tailer should follow the file
+                    // Keep scanning until the file has not been modified for the threshold number of iterations
+                    long oldPosition = position;
+                    position = readLines(reader);
+                    // Check if file was modified, if it wasn't update noModifyCounter
+                    if (oldPosition < position) {
+                        noModifyCounter = 0;
+                    } else {
+                        noModifyCounter += 1;
+                    }
+                    if(noModifyCounter >= maxIterationsBeforeClosing && maxIterationsBeforeClosing > 0) {
+                        // If the file has not been modified for a few iterations, stop
+                        stop();
+                        IOUtils.closeQuietly(reader);
+                    }
+                } else if (length < position) {
                     // File was rotated
                     listener.fileRotated();
+                    rotated = true;
+                    if (followReader) {
+                        // If we should follow the file
+                        continue;
+                    }
                     // Reopen the reader after rotation
                     try {
                         // Ensure that the old file is closed iff we re-open it successfully
